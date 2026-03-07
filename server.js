@@ -23,6 +23,8 @@ const ACTION_TIMEOUT_MS = 35000;
 const SUITS = ['♠', '♥', '♦', '♣'];
 const VALUES = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
 const EMOJIS = ['🦁', '🐺', '🦊', '🐻', '🐯', '🦅', '🐲', '🦝', '🎭', '🃏', '🤠', '👑'];
+const BOT_NAMES = ['Viper', 'Stone', 'Joker', 'Goldie', 'Ace', 'Nova', 'Blaze', 'Ghost', 'Sable', 'Rex'];
+let botIdCounter = 0;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const uid = () => crypto.randomBytes(4).toString('hex');
@@ -196,6 +198,47 @@ function resetBets(table) {
   table.seats.forEach(s => { if (s) s.bet = 0; });
 }
 
+// ─── Bot AI ───────────────────────────────────────────────────────────────────
+function addBot(table) {
+  const emptyIdx = table.seats.findIndex(s => s === null);
+  if (emptyIdx === -1) return false;
+  const name = BOT_NAMES[botIdCounter % BOT_NAMES.length];
+  const emoji = EMOJIS[botIdCounter % EMOJIS.length];
+  const botId = `bot_${++botIdCounter}`;
+  table.seats[emptyIdx] = {
+    socketId: botId, name, emoji,
+    chips: STARTING_CHIPS, bet: 0,
+    folded: false, isAllIn: false, status: '',
+    isBot: true,
+  };
+  tableLog(table, `${emoji} ${name} (bot) joined seat ${emptyIdx + 1}`, 'le-sys');
+  return true;
+}
+
+function botDecideServer(table, seatIndex, callAmt) {
+  const seat = table.seats[seatIndex];
+  const hand = table.hands[seat.socketId] || [];
+  let strength = 0.4;
+  if (hand.length >= 2) {
+    if (table.community.length > 0) {
+      strength = Math.min(1, bestOf([...hand, ...table.community]).type / 8 + 0.08);
+    } else {
+      const r1 = hand[0].rank, r2 = hand[1].rank;
+      strength = Math.min(1, (r1 + r2) / 24 + (r1 === r2 ? 0.35 : 0) + (hand[0].suit === hand[1].suit ? 0.1 : 0));
+    }
+  }
+  // Occasional bluff
+  if (Math.random() < 0.12) strength = 0.35 + Math.random() * 0.5;
+
+  if (callAmt > 0 && strength < 0.28 && Math.random() < 0.75) return { type: 'fold' };
+  if (strength > 0.68 && Math.random() < 0.45 && seat.chips > callAmt + BB * 2) {
+    const raiseTo = Math.min(seat.chips + seat.bet, table.currentBet + BB * (2 + Math.floor(Math.random() * 3)));
+    return { type: 'raise', amount: raiseTo };
+  }
+  if (callAmt > 0) return { type: 'call' };
+  return { type: 'check' };
+}
+
 // ─── Betting loop ─────────────────────────────────────────────────────────────
 async function doBetting(table, startSeat) {
   const n = table.seats.length;
@@ -228,8 +271,20 @@ async function doBetting(table, startSeat) {
 }
 
 function waitForAction(table, seatIndex, callAmt) {
+  const seat = table.seats[seatIndex];
+  // Bot: decide automatically after a short delay
+  if (seat?.isBot) {
+    return new Promise(resolve => {
+      setTimeout(() => {
+        const action = botDecideServer(table, seatIndex, callAmt);
+        const verb = action.type === 'raise' ? `raises to $${action.amount}` : action.type === 'call' ? `calls $${callAmt}` : action.type;
+        tableLog(table, `${seat.emoji} ${seat.name} ${verb}`, `le-${action.type === 'raise' ? 'raise' : 'call'}`);
+        broadcastState(table);
+        resolve(action);
+      }, 700 + Math.random() * 800);
+    });
+  }
   return new Promise(resolve => {
-    const seat = table.seats[seatIndex];
     let timer;
 
     const resolveOnce = (action) => {
@@ -351,8 +406,14 @@ function finishHand(table) {
   table.seats.forEach((s, i) => {
     if (s && s.chips <= 0) {
       tableLog(table, `${s.emoji} ${s.name} is out of chips`, 'le-sys');
-      io.to(s.socketId).emit('busted', { msg: 'Out of chips! Refresh to rejoin.' });
-      table.seats[i] = null;
+      if (s.isBot) {
+        // Rebuy bot automatically
+        s.chips = STARTING_CHIPS;
+        s.folded = false; s.isAllIn = false; s.bet = 0; s.status = '';
+      } else {
+        io.to(s.socketId).emit('busted', { msg: 'Out of chips! Refresh to rejoin.' });
+        table.seats[i] = null;
+      }
     }
   });
 
@@ -415,7 +476,7 @@ async function startHand(table) {
     if (s) {
       const hand = [table.deck.pop(), table.deck.pop()];
       table.hands[s.socketId] = hand;
-      io.to(s.socketId).emit('your_hand', { hand });
+      if (!s.isBot) io.to(s.socketId).emit('your_hand', { hand });
     }
   });
 
@@ -538,6 +599,25 @@ io.on('connection', socket => {
     const { table, seatIndex } = info;
     if (!table.pendingAction || table.pendingAction.seatIndex !== seatIndex) return;
     table.pendingAction.resolve({ type, amount: +amount || 0 });
+  });
+
+  socket.on('add_bot', () => {
+    const tableId = [...socket.rooms].find(r => r !== socket.id && tables.has(r));
+    if (!tableId) return;
+    const table = tables.get(tableId);
+    if (!table || table.gameRunning) { socket.emit('error_msg', { msg: 'Cannot add bot during a hand' }); return; }
+    const added = addBot(table);
+    if (!added) { socket.emit('error_msg', { msg: 'Table is full' }); return; }
+    broadcastState(table);
+    io.emit('tables_list', getTablesList());
+    const seated = seatedPlayers(table);
+    if (seated.length >= 2 && !table.gameRunning) {
+      if (table.startTimer) clearTimeout(table.startTimer);
+      table.startTimer = setTimeout(() => {
+        if (!table.gameRunning && seatedPlayers(table).length >= 2) startHand(table);
+      }, 3000);
+      io.to(tableId).emit('game_starting', { countdown: 3 });
+    }
   });
 
   socket.on('chat', ({ msg } = {}) => {

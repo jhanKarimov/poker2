@@ -791,6 +791,19 @@ body { background:radial-gradient(ellipse at 50% 15%,#1c0d04 0%,#070402 70%); co
     <div class="mp-tname" id="mp-tname">Table</div>
     <div class="mp-tsub" id="mp-tsub">Pick a seat to join</div>
 
+    <!-- Name setup (shown before seated) -->
+    <div id="mp-tbl-name-row" class="mp-name-area" style="width:100%;margin-bottom:12px">
+      <div class="mp-label">YOUR NAME &amp; AVATAR</div>
+      <div class="mp-name-row">
+        <select id="mp-tbl-emoji" class="mp-emoji-sel">
+          <option>😎</option><option>🦁</option><option>🐺</option><option>🦊</option>
+          <option>🐻</option><option>🐯</option><option>🦅</option><option>🐲</option>
+          <option>🤠</option><option>👑</option><option>🎭</option><option>🃏</option>
+        </select>
+        <input id="mp-tbl-name" type="text" placeholder="Enter your name..." maxlength="20" class="mp-input">
+      </div>
+    </div>
+
     <div class="mp-seat-grid" id="mp-seat-grid"></div>
 
     <div class="mp-status-bar" id="mp-status-bar">Pick an empty seat to join the game</div>
@@ -798,6 +811,10 @@ body { background:radial-gradient(ellipse at 50% 15%,#1c0d04 0%,#070402 70%); co
     <div class="mp-share-box" id="mp-share-box" style="display:none">
       <div class="mp-share-label">Share link with friends:</div>
       <div class="mp-share-link" id="mp-share-link" onclick="mpCopyLink()" title="Click to copy"></div>
+    </div>
+
+    <div id="mp-bot-row" style="display:none;gap:8px;margin-bottom:6px;flex-wrap:wrap;justify-content:center">
+      <button class="lobby-btn-online" onclick="mpAddBot()" style="padding:7px 18px;font-size:10px">+ Add Bot</button>
     </div>
 
     <div id="mp-chat-area" style="display:none">
@@ -828,6 +845,7 @@ body { background:radial-gradient(ellipse at 50% 15%,#1c0d04 0%,#070402 70%); co
     <button class="nav-btn" onclick="openModal('intel-m');renderBotIntel()">🤖 Bot Intel</button>
     <button class="nav-btn" onclick="openModal('dstats-m');renderDeepStats()">📊 Deep Stats</button>
     <button class="nav-btn" onclick="openModal('bj-m')" style="border-color:rgba(255,100,100,.3);color:#cc6666">🃏 Blackjack</button>
+    <button class="nav-btn" id="btn-online" onclick="openMpOverlay()" style="border-color:rgba(74,158,255,.35);color:#4a9eff">🌐 Online</button>
   </div>
   <div id="hdr-right">
     <div class="hstat"><span class="l">Bank</span><span class="v" id="hdr-money">$1,500</span></div>
@@ -948,7 +966,7 @@ body { background:radial-gradient(ellipse at 50% 15%,#1c0d04 0%,#070402 70%); co
      CONTROLS
 ══════════════════════════════════════════════════ -->
 <div id="controls">
-  <button class="btn btn-deal" id="btn-deal" onclick="startGame()">🃏 DEAL</button>
+  <button class="btn btn-deal" id="btn-deal" onclick="if(mpMode){openMpOverlay();}else{startGame();}">🃏 DEAL</button>
   <button class="btn btn-fold"  id="btn-fold"  onclick="act('fold')"  disabled>FOLD</button>
   <button class="btn btn-check" id="btn-check" onclick="act('check')" disabled>CHECK</button>
   <button class="btn btn-call"  id="btn-call"  onclick="act('call')"  disabled>CALL</button>
@@ -2645,16 +2663,26 @@ function mpJoinTable(tableId) {
 
 function mpSitDown(seatIndex) {
   if (mpMySeatIndex !== -1) return;
-  const name = document.getElementById('mp-name-in').value.trim() || 'Guest';
-  const emoji = document.getElementById('mp-emoji-sel').value;
+  // Read name from table-screen inputs (preferred) or lobby inputs as fallback
+  const nameEl = document.getElementById('mp-tbl-name') || document.getElementById('mp-name-in');
+  const emojiEl = document.getElementById('mp-tbl-emoji') || document.getElementById('mp-emoji-sel');
+  const name = (nameEl?.value.trim()) || 'Guest';
+  const emoji = emojiEl?.value || '😎';
   mpSocket.emit('sit_down', { seatIndex, name, emoji });
   mpMySeatIndex = seatIndex;
-  document.getElementById('mp-status-bar').textContent = 'Seated! Waiting for 2nd player...';
+  document.getElementById('mp-status-bar').textContent = 'Seated! Waiting for opponent...';
   document.getElementById('mp-status-bar').classList.add('active');
   document.getElementById('mp-share-box').style.display = 'block';
   document.getElementById('mp-chat-area').style.display = 'block';
+  document.getElementById('mp-bot-row').style.display = 'flex';
+  document.getElementById('mp-tbl-name-row').style.display = 'none';
   const url = `${window.location.origin}${window.location.pathname}?table=${mpTableId}`;
   document.getElementById('mp-share-link').textContent = url;
+}
+
+function mpAddBot() {
+  if (!mpSocket?.connected) return;
+  mpSocket.emit('add_bot');
 }
 
 function mpLeaveTable() {
@@ -2668,6 +2696,11 @@ function mpLeaveTable() {
   setControls(false);
   document.getElementById('mp-ingame-bar').classList.remove('show');
   document.getElementById('mp-float-chat').classList.remove('show');
+  // Reset table screen state
+  const nameRow = document.getElementById('mp-tbl-name-row');
+  if (nameRow) nameRow.style.display = 'block';
+  const botRow = document.getElementById('mp-bot-row');
+  if (botRow) botRow.style.display = 'none';
   // Restore single-player state
   gamePhase = 'idle';
   inShowdown = false;
@@ -2685,6 +2718,9 @@ function mpRenderTableScreen(state) {
   document.getElementById('mp-tname').textContent = state.name;
   const cnt = state.seats.filter(s => s !== null).length;
   document.getElementById('mp-tsub').textContent = `${cnt}/${state.seats.length} players`;
+  // Show/hide bot button only when seated
+  const botRow = document.getElementById('mp-bot-row');
+  if (botRow) botRow.style.display = mpMySeatIndex !== -1 ? 'flex' : 'none';
 
   const grid = document.getElementById('mp-seat-grid');
   grid.innerHTML = state.seats.map((seat, i) => {
